@@ -266,7 +266,7 @@ DC1: VM APISIX ZG
 
 #### Pattern 2 - Cả 2 RGW-data và RGW-sync đều đi qua APISIX
 
-##### [Luồng S3 request tới RGW-data thông qua APISIX tương tự với Pattern 1](#luong-s3-request-toi-rgw-data-thong-qua-apisix)
+##### [Luồng S3 request tới RGW-data thông qua APISIX tương tự với Pattern 1](#luồng-s3-request-tới-rgw-data-thông-qua-apisix)
 ##### Luồng sync giữa RGW-sync của 2 DC thông qua APISIX
 ```
 [RGW-Sync DC1]
