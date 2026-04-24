@@ -274,17 +274,19 @@ ADMIN ────────┼─► :9180 (Inbound)                  │
 ```
 - Theo các đánh giá hiện tại VNPAY đưa ra 2 phương án triển khai là gộp APISIX DC vào cùng node của Cluster Ceph tại từng DC hoặc là tách APISIX DC thành node riêng biệt được đặt cùng DC với node của Cluster Ceph. Tiếp đó tại từng phương án có đánh giá việc đặt sync có đi qua APISIX hay không.
   - Patter 1: Chỉ RGW-Data đi qua APISIX
-    ├─ [Phương án A](#phương-án-1a--3-vm-gộp-apisix-vào-ceph-vm): 3 VM - gộp
-    └─ [Phương án B](#phương-án-1b--5-vm-tách-hoàn-toàn): 5 VM - tách
+    - [Phương án A](#phương-án-1a--3-vm-gộp-apisix-vào-ceph-vm): 3 VM - gộp
+    - [Phương án B](#phương-án-1b--5-vm-tách-hoàn-toàn): 5 VM - tách
   - Patter 2: Cả RGW-Data và RGW-Sync đi qua APISIX
-    ├─ [Phương án A](#phương-án-2a--3-vm-gộp-apisix-vào-ceph-vm): 3 VM - gộp
-    └─ [Phương án B](#phương-án-2b--5-vm-tách-hoàn-toàn): 5 VM - tách
-
-|     | 1.A | 1.B | 2.A | 2.B |
-| --- | --- | --- | --- | --- |
-| ✅ Ưu | Ít VM, đơn giản, triển khai nhanh | Full isolation, blast radius nhỏ | Ít VM, log Sync tập trung | Full isolation + Sync visibility |
-| ❌ Nhược | Resource contention Ceph+APISIX | +2 VM, chi phí cao hơn | 3 workload tranh tài nguyên, APISIX die = mất Sync | +2 VM, Sync thêm 1 hop, config phức tạp |
-| ⚠️ Lưu ý | Cần cgroup/CPU pinning | Không monitor Sync traffic | timeout = 0, graceful restart bắt buộc | 2 Route riêng :443/:3951, graceful restart |
+    - [Phương án A](#phương-án-2a--3-vm-gộp-apisix-vào-ceph-vm): 3 VM - gộp
+    - [Phương án B](#phương-án-2b--5-vm-tách-hoàn-toàn): 5 VM - tách
+<pre>
+  - Patter 1: Chỉ RGW-Data đi qua APISIX
+    ├─ <a href ="#phương-án-1a--3-vm-gộp-apisix-vào-ceph-vm"> Phương án A </a>: 3 VM - gộp
+    └─ <a href ="#phương-án-1b--5-vm-tách-hoàn-toàn"> Phương án B </a>: 5 VM - tách
+  - Patter 2: Cả RGW-Data và RGW-Sync đi qua APISIX
+    ├─ <a href ="#phương-án-2a--3-vm-gộp-apisix-vào-ceph-vm"> Phương án A </a>: 3 VM - gộp
+    └─ <a href ="#phương-án-2b--5-vm-tách-hoàn-toàn"> Phương án B </a>: 5 VM - tách
+</pre>
 
 |     | 1.A | 1.B | 2.A | 2.B |
 | --- | --- | --- | --- | --- |
@@ -334,6 +336,80 @@ t=60s   RGW-Sync DC1 nhận RST, phải reconnect
         → log đầy error reconnect
         → worst case: object chưa sync xong bị bỏ dở
 ```
+
+```
+# Các điểm khác biệt giữa hoạt động của RGW-Sync vs RGW-Data
+                  RGW-Data (:443→:3950)     RGW-Sync (:3951→:3951)
+                ────────────────────────   ──────────────────────────
+Connection type   Short-lived               Long-lived / persistent
+                  (request/response)        (streaming, keep-alive dài)
+
+Timeout           Ngắn chấp nhận được       Phải set rất cao hoặc = 0
+                  (30s–300s)                nếu không Sync bị ngắt
+
+Traffic pattern   Nhiều request nhỏ         Ít connection, data lớn
+                  song song                 liên tục
+
+Rate limit        Nên có                    KHÔNG được rate-limit
+                  (chống abuse)             (Sync phải chạy tự do)
+
+Caller            S3 Client bên ngoài       RGW-Sync của DC kia
+                                            (internal, trusted)
+
+Plugin nên dùng   ip-restriction            ip-restriction
+                  limit-req                 (KHÔNG limit-req)
+                  jwt-auth / hmac           log only
+                  prometheus                prometheus
+```
+
+
+```
+# Lưu Ý Khi Cho RGW-Sync Đi Qua APISIX: Khuyến nghị thực tế là tạo 2 Route riêng biệt trên APISIX cho :443 (S3 client) và :3951 (RGW-Sync) với timeout config khác nhau — S3 client timeout ngắn, Sync timeout rất dài hoặc disabled.
+                  Lợi ích                    Rủi ro / Lưu ý
+                ────────────────────        ─────────────────────────────
+RGW-Data :443   TLS termination tập         Cần tune buffer lớn cho
+                trung, rate limit,          multipart upload
+                health check, log
+
+RGW-Sync :3951  Centralized mTLS,           ⚠️ Sync là long-lived HTTP
+                log sync traffic,           connection, stream lớn
+                health check Sync           → cần tắt timeout hoặc
+                instance                    set rất cao trên APISIX
+                                            (proxy_read_timeout lớn)
+
+                                            ⚠️ Sync failure = data
+                                            inconsistency → cần alert
+                                            riêng cho port :3951
+```
+
+|       | Đánh giá |
+| ----- | -------- |
+| Ưu    | Isolation hoàn toàn: Ceph và APISIX không tranh tài nguyên. Blast radius nhỏ: APISIX die không ảnh hưởng Ceph và ngược lại. Tune độc lập: mỗi VM tối ưu riêng cho workload của nó. Scale độc lập: tăng APISIX VM khi traffic tăng, không cần đụng Ceph. Dễ troubleshoot, log rõ ràng theo role |
+| Nhược | +2 VM → chi phí hardware/OS/vận hành cao hơn. Network hop giữa APISIX VM → Ceph VM (thêm ~0.1-0.3ms latency trong nội DC, chấp nhận được) |
+
+| Trường hợp                               | Khuyến nghị                                     |
+| ---------------------------------------- | ----------------------------------------------- |
+| Dev / Lab / PoC, tài nguyên hạn chế      | 1.A — Đơn giản, nhanh, không cần HA Sync        |
+| Production on-prem, SLA S3 API cao       | 1.B — Isolation tốt, Sync direct không rủi ro   |
+| Cần audit log toàn bộ traffic kể cả Sync  | 2.B — Visibility đầy đủ nhưng cần tune cẩn thận |
+| Cần giảm VM nhưng vẫn monitor Sync       | 2.A — Chỉ chấp nhận ở môi trường non-critical   |
+| Tương lai scale thêm APISIX instance     | 1.B hoặc 2.B                                    |
+
+> **Khuyến nghị**:
+> - Nên chọn Phương án B (5 VM) cho môi trường production S3RGW vì:
+>   - Ceph OSD workload rất bất thường (rebalance, recovery, backfill đột ngột spike IO/CPU) — nếu gộp chung sẽ gây latency spike cho APISIX, ảnh hưởng trực tiếp SLA S3 API
+>   - APISIX cần được tune riêng (connection pool, worker process, ulimit) — conflict với Ceph sysctl
+>   - Khi cần mở rộng (thêm APISIX instance sau etcd cluster), phương án B linh hoạt hơn nhiều
+>   - Phù hợp với nguyên tắc No Single Point of Failure trong HLD v8 — không để gateway và storage cùng một failure domain
+> - Nếu chi phí VM thực sự là constraint, phương án thỏa hiệp là gộp APISIX ZG vào DC1 với APISIX DC1 (giảm xuống 4 VM), vì APISIX ZG chỉ làm nhiệm vụ routing nhẹ hơn so với APISIX DC1/DC2 xử lý data traffic.
+> - Nên chọn Phương án 1.B (5 VM) cho môi trường production S3RGW vì:
+>   - RGW-Sync là critical path — mọi gián đoạn Sync dẫn đến data inconsistency giữa DC1 và DC2. Không nên đặt thêm điểm lỗi (APISIX) vào luồng này trừ khi có yêu cầu rõ ràng về visibility
+>   - Ceph OSD workload bất thường (rebalance, recovery) → cần tách hoàn toàn khỏi APISIX để bảo vệ SLA S3 API
+>   - Nếu sau này cần monitor Sync traffic, có thể chuyển lên 2.B bằng cách thêm Route :3951 vào APISIX DC1/DC2 mà không cần thay đổi topology VM
+
+
+
+
 #### Pattern 1 - Chỉ RGW-data đi qua APISIX
 ##### Phương án 1.A — 3 VM (gộp APISIX vào Ceph VM)
 ```
@@ -371,12 +447,6 @@ CLIENT ──► APISIX ──► RGW-Data :3950
     └──► S3 API SLA bị ảnh hưởng
 ```
 
-|          | Đánh giá                                                                                              |
-| -------- | ----------------------------------------------------------------------------------------------------- |
-| ✅ Ưu    | Đơn giản nhất, ít VM, triển khai nhanh. RGW-Sync không đổi luồng, không rủi ro timeout                |
-| ❌ Nhược | Resource contention Ceph + APISIX chung VM. Blast radius lớn. Ceph OSD spike ảnh hưởng S3 API latency |
-| ⚠️ Lưu ý | Cần cgroup/CPU pinning để APISIX và Ceph không tranh nhau. OS-level sysctl tuning phức tạp            |
-
 ##### Phương án 1.B — 5 VM (tách hoàn toàn)
 ```
 DC1: VM Ceph DC1
@@ -409,11 +479,6 @@ DC1: VM APISIX ZG
     APISIX traffic     → không tranh CPU/RAM Ceph
     Blast radius nhỏ  → VM die độc lập
 ```
-|          | Đánh giá                                                                                                                   |
-| -------- | -------------------------------------------------------------------------------------------------------------------------- |
-| ✅ Ưu    | Full isolation Ceph vs APISIX. Blast radius nhỏ. Tune độc lập. Scale độc lập. RGW-Sync không bị ảnh hưởng bởi APISIX config |
-| ❌ Nhược | +2 VM → chi phí cao hơn. Thêm network hop APISIX VM → Ceph VM (~0.1–0.3ms, chấp nhận được)                                 |
-| ⚠️ Lưu ý | RGW-Sync đi thẳng DC1 → DC2, không đi qua APISIX → không có log/monitor Sync traffic tập trung                              |
 
 
 #### Pattern 2 - Cả 2 RGW-data và RGW-sync đều đi qua APISIX
@@ -474,80 +539,6 @@ DC1 APISIX :3951 ◄────────────────────
 │    s3.rgw-tenant.vn          │
 └──────────────────────────────┘
 ```
-|          | Đánh giá                                                                                                                   |
-| -------- | -------------------------------------------------------------------------------------------------------------------------- |
-| ✅ Ưu    | Full isolation. Log + monitor tập trung cả Data lẫn Sync. Ceph không bị ảnh hưởng khi APISIX config thay đổi. Scale và tune hoàn toàn độc lập   |
-| ❌ Nhược | +2 VM. Sync đi qua thêm 1 hop APISIX → cần tune timeout cẩn thận. Config phức tạp hơn 1.B                                   |
-| ⚠️ Lưu ý | Cần 2 Route riêng trên APISIX DC1/DC2: <br> - Route :443 (timeout ngắn, rate-limit) <br> - Route :3951 (timeout = 0, không rate-limit). <br> APISIX restart phải graceful để Sync không bị ngắt đột ngột |
-
-```
-# Các điểm khác biệt giữa hoạt động của RGW-Sync vs RGW-Data
-                  RGW-Data (:443→:3950)     RGW-Sync (:3951→:3951)
-                ────────────────────────   ──────────────────────────
-Connection type   Short-lived               Long-lived / persistent
-                  (request/response)        (streaming, keep-alive dài)
-
-Timeout           Ngắn chấp nhận được       Phải set rất cao hoặc = 0
-                  (30s–300s)                nếu không Sync bị ngắt
-
-Traffic pattern   Nhiều request nhỏ         Ít connection, data lớn
-                  song song                 liên tục
-
-Rate limit        Nên có                    KHÔNG được rate-limit
-                  (chống abuse)             (Sync phải chạy tự do)
-
-Caller            S3 Client bên ngoài       RGW-Sync của DC kia
-                                            (internal, trusted)
-
-Plugin nên dùng   ip-restriction            ip-restriction
-                  limit-req                 (KHÔNG limit-req)
-                  jwt-auth / hmac           log only
-                  prometheus                prometheus
-```
-
-###### Lưu Ý Khi Cho RGW-Sync Đi Qua APISIX: Khuyến nghị thực tế là tạo 2 Route riêng biệt trên APISIX cho :443 (S3 client) và :3951 (RGW-Sync) với timeout config khác nhau — S3 client timeout ngắn, Sync timeout rất dài hoặc disabled.
-```
-                  Lợi ích                    Rủi ro / Lưu ý
-                ────────────────────        ─────────────────────────────
-RGW-Data :443   TLS termination tập         Cần tune buffer lớn cho
-                trung, rate limit,          multipart upload
-                health check, log
-
-RGW-Sync :3951  Centralized mTLS,           ⚠️ Sync là long-lived HTTP
-                log sync traffic,           connection, stream lớn
-                health check Sync           → cần tắt timeout hoặc
-                instance                    set rất cao trên APISIX
-                                            (proxy_read_timeout lớn)
-
-                                            ⚠️ Sync failure = data
-                                            inconsistency → cần alert
-                                            riêng cho port :3951
-```
-
-|       | Đánh giá |
-| ----- | -------- |
-| Ưu    | Isolation hoàn toàn: Ceph và APISIX không tranh tài nguyên. Blast radius nhỏ: APISIX die không ảnh hưởng Ceph và ngược lại. Tune độc lập: mỗi VM tối ưu riêng cho workload của nó. Scale độc lập: tăng APISIX VM khi traffic tăng, không cần đụng Ceph. Dễ troubleshoot, log rõ ràng theo role |
-| Nhược | +2 VM → chi phí hardware/OS/vận hành cao hơn. Network hop giữa APISIX VM → Ceph VM (thêm ~0.1-0.3ms latency trong nội DC, chấp nhận được) |
-
-| Trường hợp                               | Khuyến nghị                                     |
-| ---------------------------------------- | ----------------------------------------------- |
-| Dev / Lab / PoC, tài nguyên hạn chế      | 1.A — Đơn giản, nhanh, không cần HA Sync        |
-| Production on-prem, SLA S3 API cao       | 1.B — Isolation tốt, Sync direct không rủi ro   |
-| Cần audit log toàn bộ traffic kể cả Sync  | 2.B — Visibility đầy đủ nhưng cần tune cẩn thận |
-| Cần giảm VM nhưng vẫn monitor Sync       | 2.A — Chỉ chấp nhận ở môi trường non-critical   |
-| Tương lai scale thêm APISIX instance     | 1.B hoặc 2.B                                    |
-
-> **Khuyến nghị**:
-> - Nên chọn Phương án B (5 VM) cho môi trường production S3RGW vì:
->   - Ceph OSD workload rất bất thường (rebalance, recovery, backfill đột ngột spike IO/CPU) — nếu gộp chung sẽ gây latency spike cho APISIX, ảnh hưởng trực tiếp SLA S3 API
->   - APISIX cần được tune riêng (connection pool, worker process, ulimit) — conflict với Ceph sysctl
->   - Khi cần mở rộng (thêm APISIX instance sau etcd cluster), phương án B linh hoạt hơn nhiều
->   - Phù hợp với nguyên tắc No Single Point of Failure trong HLD v8 — không để gateway và storage cùng một failure domain
-> - Nếu chi phí VM thực sự là constraint, phương án thỏa hiệp là gộp APISIX ZG vào DC1 với APISIX DC1 (giảm xuống 4 VM), vì APISIX ZG chỉ làm nhiệm vụ routing nhẹ hơn so với APISIX DC1/DC2 xử lý data traffic.
-> - Nên chọn Phương án 1.B (5 VM) cho môi trường production S3RGW vì:
->   - RGW-Sync là critical path — mọi gián đoạn Sync dẫn đến data inconsistency giữa DC1 và DC2. Không nên đặt thêm điểm lỗi (APISIX) vào luồng này trừ khi có yêu cầu rõ ràng về visibility
->   - Ceph OSD workload bất thường (rebalance, recovery) → cần tách hoàn toàn khỏi APISIX để bảo vệ SLA S3 API
->   - Nếu sau này cần monitor Sync traffic, có thể chuyển lên 2.B bằng cách thêm Route :3951 vào APISIX DC1/DC2 mà không cần thay đổi topology VM
 
 
 ---
