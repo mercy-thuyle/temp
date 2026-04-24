@@ -129,62 +129,87 @@ Deployment mode của APISIX:
 
 ---
 ### 5. Mô hình triển khai
-#### Pattern 1 - Chỉ RGW-data đi qua APISIX
 
 ##### Inbound/Outbound listen port
 ```
-                    APISIX ZG
+                     APISIX ZG
               ┌────────────────────────────────────┐
 CLIENT ───────┼─► :443  (Inbound)                  │  - ZoneGroup endpoint duy nhất cho client
 (S3 API/      │ Data Plane Listener                │  - TLS terminate, Split-Horizon DNS
- App/SDK)     │   s3.rgw-tenant.vn                 │  - Route sang DC1 hoặc DC2 theo health check
-              │   → nhận S3 request                │
+ App/SDK)     │ s3.rgw-tenant.vn                   │  - Route sang DC1 hoặc DC2 theo health check
+              │    → nhận S3 request               │
               │          │                         │
               │          ▼                         │
               │ [Plugin chain S3]                  │
               │   ip-restriction, limit-req,       │
               │   prometheus                       │
-              │ [Upstream] backend (Outbound) ─────┼─► APISIX DC1 (hoặc DC2) :443
-              │ [Balancer + Health Check]          │  - Forward tới APISIX DC1/DC2
-              │ (active health check DC1/DC2)      │  - Không thẳng RGW, không proxy Sync    
-              │                                    │    
-ADMIN ────────┼─► :9180 (Inbound)                  │
-(curl/UI)     │ Control Plane - Admin API          │  - IP whitelist nghiêm ngặt
-              │   → CRUD Route/Upstream/Plugin     │
-              │   → ghi vào etcd                   │
+              │ [Upstream] backend (Outbound) ─────┼─► APISIX DC1 :443
+              │ [Balancer + Health Check]     ─────┼─► APISIX DC2 :443
+              │ (active health check DC1/DC2)      │  - Không proxy Sync traffic
+              │                                    │  - Forward S3 API tới APISIX DC1/DC2
+              │                                    │              
+ADMIN ────────┼──► :9180 (Inbound)                 │
+(curl/UI)     │ Control Plane - Admin API Listener │  - IP whitelist nghiêm ngặt
+              │    → CRUD Route/Upstream/Plugin    │
+              │    → ghi vào etcd                  │
               └────────────────────────────────────┘
                     APISIX DC1 / DC2
               ┌────────────────────────────────────┐
-CLIENT ───────┼─► :443 (Inbound)                   |  - Nhận S3 request từ client, public port 443 cho client thấy
-(S3 API/      │ Data Plane Listener                │  - TLS terminate tại đây, APISIX giải mã rồi forward xuống
- App/SDK)     │   → nhận S3 request                │
-              │         │                          │
-              │         ▼                          │
-              │ [Plugin chain]                     │
-              |   ip-restriction, limit-req,       │ 
-              |   jwt/hmac, prometheus             │
+CLIENT ───────┼─► :443  (Inbound)                  │  - Nhận S3 request từ client,
+(S3 API/      │ Data Plane Listener                │       public port 443 cho client thấy
+ App/SDK)     │    → nhận S3 request               │  - TLS terminate tại đây,
+              │          │                         │       APISIX giải mã rồi forward xuống
+              │          ▼                         │
+              │ [Plugin chain S3].                 │
+              │   ip-restriction, limit-req,       │
+              │   jwt/hmac, prometheus             │
               │ [Upstream] backend (Outbound) ─────┼─► RGW-Data DC1(hoặc DC2) :3950
-              │ [Balancer]                         │  - APISIX chỉ là client, RGW-data mới là server
+              │ [Balancer]                         │  - APISIX là client, RGW-Data là server
               │                                    │  - APISIX không listen :3950
-              │                                    │
-              │ ✖ RGW-Sync KHÔNG đi qua APISIX     │  - RGW-Sync DC1 :3951 ◄──► RGW-Sync DC2 :3951
-              │   Sync bypass thẳng DC1 ↔ DC2      │    kết nối trực tiếp, không qua APISIX
-              │                                    │
+              ┼────────────────────────────────────┼
+              │ ✖ RGW-Sync KHÔNG đi qua APISIX     │  - Block này chỉ tồn tại khi chọn pattern 1
+              │ Sync bypass thẳng giữa DC1 ↔ DC2   │  - 2 RGW-Sync kết nối trực tiếp, không qua APISIX
+              │                                    │    RGW-Sync DC1 :3951 ◄──► RGW-Sync DC2 :3951
+              ┼─────────────── HOẶC ───────────────┼
+RGW-Sync ─────┼─► :3951 (Inbound)                  │  - Block này chỉ tồn tại khi chọn pattern 2
+              │ Data Plane Listener                │  - 2 RGW-Sync đi qua APISIX để sync internal 2 DC
+              │    → nhận Sync request             │  
+              │          │                         │
+              │          ▼                         │
+              │ [Plugin chain Sync]                │  - Cả 2 DC chủ động gọi vào DC còn lại để sync
+              │   ip-restriction (IP của DC kia)   │  - Long-lived / persistent connection
+              │   log, prometheus                  │  - KHÔNG rate-limit
+              │   timeout = 0                      │
+              │ [Upstream] backend (Outbound) ─────┼─► RGW-Sync DC1(hoặc DC2) :3951
+              │ [Balancer]                         │  - APISIX là client, RGW-Sync là server
+              │                                    │  - APISIX không listen :3951 phía backend
+              ┼────────────────────────────────────┼              
 ADMIN ────────┼─► :9180 (Inbound)                  │
-(curl/UI)     │ Control Plane - Admin API Listener │  - Không có traffic S3 đi qua đây
-              │   → CRUD Route/Upstream/Plugin     │  - Chỉ dùng để cấu hình APISIX (CRUD đối tượng)
-              │   → ghi vào etcd                   │  - Phải IP whitelist nghiêm ngặt, không expose internet
+(curl/UI)     │ Control Plane - Admin API Listener │  - Không có traffic S3/Sync đi qua đây
+              │    → CRUD Route/Upstream/Plugin    │  - Chỉ dùng cấu hình APISIX
+              │    → ghi vào etcd                  │  - IP whitelist nghiêm ngặt, không expose
               └────────────────────────────────────┘
-
+```
+```
 ═══════════════════════════════════════════════════════════════════════════════════════════════
- Port Summary — Pattern 1
+ Port Summary — Pattern 1 vs Pattern 2
 ─────────────────────────────────────────────────────────────────────────────────────────────
- Port   Direction            Plugin nên dùng                Ghi chú
- :443   Inbound  (client)    ip-restriction, limit-req,     S3 traffic, TLS terminate
-                             jwt/hmac, prometheus
- :3950  Outbound (→ RGW)     N/A (upstream config)          APISIX không listen port này
- :3951  —                    —                              Bypass APISIX hoàn toàn
- :9180  Inbound  (admin)     IP whitelist OS-level          Control Plane only
+ Port   Direction          Plugin nên dùng                              P1          P2
+ :443   Inbound (client)   ip-restriction, limit-req,                   ✅          ✅
+                           jwt/hmac, prometheus
+        Ghi chú            S3 traffic, TLS terminate
+ ───────────────────────────────────────────────────────────────────────────────────────────
+ :3950  Outbound (→ RGW)   N/A (upstream config)                         ✅          ✅
+        Ghi chú            APISIX không listen port này
+ ───────────────────────────────────────────────────────────────────────────────────────────
+ :3951  Inbound (DC kia)   ip-restriction (DC IP only),                 —           ✅ ⚠️
+                           log, prometheus                              Bypass      Long-lived
+        Ghi chú            timeout = 0, KHÔNG limit-req                 APISIX      timeout = 0
+ :3951  Outbound (→ RGW)   N/A (upstream config)                         —           ✅
+        Ghi chú            keepalive idle_timeout = 3600s+
+ ───────────────────────────────────────────────────────────────────────────────────────────
+ :9180  Inbound (admin)    IP whitelist OS-level                         ✅         ✅
+        Ghi chú            Control Plane only, không expose internet
 ═══════════════════════════════════════════════════════════════════════════════════════════════
 ```
 
@@ -217,7 +242,99 @@ ADMIN ────────┼─► :9180 (Inbound)                  │
     ▼
 [S3 Client]
 ```
+##### Luồng sync giữa RGW-sync của 2 DC thông qua APISIX
+```
+[RGW-Sync DC1]
+    │
+    │ 1. Outbound HTTP → APISIX DC2 :3951
+    │    (DC1 chủ động kết nối sang DC2)
+    ▼
+[APISIX DC2] Listener :3951
+    │  Router match port :3951
+    │  Plugin chain:
+    │   ├─ ip-restriction  (chỉ cho phép IP DC1)
+    │   ├─ proxy-rewrite   (nếu cần)
+    │   └─ log             (audit sync traffic)
+    │  Balancer → RGW-Sync DC2
+    │
+    │ 2. Outbound HTTP → RGW-Sync DC2 :3951
+    ▼
+[RGW-Sync DC2 :3951]
+    │  Xử lý sync metadata/data
+    │  Ghi vào RADOS Pool DC2
+    │
+    │ 3. Response → APISIX DC2
+    ▼
+[APISIX DC2]
+    │
+    │ 4. Response → RGW-Sync DC1
+    ▼
+[RGW-Sync DC1]
+    (xác nhận sync thành công)
+```
+- Theo các đánh giá hiện tại VNPAY đưa ra 2 phương án triển khai là gộp APISIX DC vào cùng node của Cluster Ceph tại từng DC hoặc là tách APISIX DC thành node riêng biệt được đặt cùng DC với node của Cluster Ceph. Tiếp đó tại từng phương án có đánh giá việc đặt sync có đi qua APISIX hay không.
+  - Patter 1: Chỉ RGW-Data đi qua APISIX
+    ├─ [Phương án A](#phương-án-1a--3-vm-gộp-apisix-vào-ceph-vm): 3 VM - gộp
+    └─ [Phương án B](#phương-án-1b--5-vm-tách-hoàn-toàn): 5 VM - tách
+  - Patter 2: Cả RGW-Data và RGW-Sync đi qua APISIX
+    ├─ [Phương án A](#phương-án-2a--3-vm-gộp-apisix-vào-ceph-vm): 3 VM - gộp
+    └─ [Phương án B](#phương-án-2b--5-vm-tách-hoàn-toàn): 5 VM - tách
 
+|     | 1.A | 1.B | 2.A | 2.B |
+| --- | --- | --- | --- | --- |
+| ✅ Ưu | Ít VM, đơn giản, triển khai nhanh | Full isolation, blast radius nhỏ | Ít VM, log Sync tập trung | Full isolation + Sync visibility |
+| ❌ Nhược | Resource contention Ceph+APISIX | +2 VM, chi phí cao hơn | 3 workload tranh tài nguyên, APISIX die = mất Sync | +2 VM, Sync thêm 1 hop, config phức tạp |
+| ⚠️ Lưu ý | Cần cgroup/CPU pinning | Không monitor Sync traffic | timeout = 0, graceful restart bắt buộc | 2 Route riêng :443/:3951, graceful restart |
+
+|     | 1.A | 1.B | 2.A | 2.B |
+| --- | --- | --- | --- | --- |
+| ✅ Ưu | Ít VM nhất, đơn giản, triển khai nhanh. | Full isolation Ceph vs APISIX. | Ít VM nhất. | Full isolation Ceph vs APISIX. |
+| | RGW-Sync không đổi luồng, không rủi ro | Blast radius nhỏ. Tune và scale độc lập. | Log + monitor tập trung cả Data và Sync traffic. | Log + monitor tập trung cả Data và Sync traffic. |
+| | timeout | RGW-Sync không bị ảnh hưởng bởi APISIX | Có thể alert Sync failure qua APISIX | Scale và tune hoàn toàn độc lập. |
+| ❌ Nhược  | Resource contention Ceph + APISIX chung VM. | +2 VM → chi phí cao hơn. | Worst case: 3 workload nặng tranh tài nguyên | +2 VM → chi phí cao hơn. |
+| | Blast radius lớn. | Thêm network hop APISIX → Ceph VM | (Ceph + APISIX + Sync traffic). | Sync thêm 1 hop APISIX → cần tune timeout. |
+| | Ceph OSD spike ảnh hưởng S3 API latency | (~0.1–0.3ms, chấp nhận được) | APISIX die = mất cả S3 API lẫn Sync | Config phức tạp hơn 1.B |
+| | | | → data inconsistency nguy hiểm | |
+| ⚠️ Lưu ý | Cần cgroup/CPU pinning để APISIX và Ceph | RGW-Sync bypass APISIX hoàn toàn | timeout = 0 cho :3951 ⚠️ bắt buộc | timeout = 0 cho :3951 ⚠️ bắt buộc |
+| | không tranh nhau. | → không có log/monitor Sync tập trung | APISIX restart phải graceful | APISIX restart phải graceful |
+| | OS-level sysctl tuning phức tạp | | → Sync bị ngắt → window inconsistency tạm thời | Cần 2 Route riêng: :443 và :3951 |
+| | | | | với timeout config khác nhau |
+
+
+Ma trận so sánh
+|                     |   1.A   |   1.B   |   2.A   |       2.B         |
+| ------------------- | ------- | ------- | ------- | ---------------   |
+| VM count            |    3    |    5    |    3    |        5          |
+| Chi phí             |   Thấp  | Cao hơn |   Thấp  |     Cao hơn       |
+| Resource isolation  |    ❌   |   ✅    |  ❌ ❌  |       ✅         |
+| Blast radius        |    ❌   |   ✅    |  ❌❌   |       ✅         |
+| Sync visibility     |    ❌   |   ❌    |   ✅    |       ✅         |
+| Sync risk           |   Thấp  |  Thấp   |   Cao   |    Trung bình    | 
+| Config phức tạp      |   Thấp  |  Trung  |  Trung  |       Cao        |
+| SLA S3 API          |    ⚠️   |   ✅    |   ❌    |       ✅         |
+| Production-ready    |    ❌   |   ✅    |   ❌    | ⚠️ với điều kiện |
+
+Nguyên Nhân Gốc: Bản Chất RGW-Sync
+Timeout = 0 là yêu cầu của RGW-Sync connection, bất kể đi qua APISIX nào, topology nào. Timeout = 0 Áp Dụng Cho Mọi Pattern Có Sync Qua APISIX.
+```
+# RGW-Sync hoạt động theo kiểu:
+  DC1 mở 1 HTTP connection → DC2
+  │
+  └─ Connection này KHÔNG đóng sau mỗi request
+     Nó giữ mở liên tục (streaming / long-lived)
+     RGW-Sync dùng nó để push metadata/data liên tục
+     Có thể kéo dài hàng giờ, hàng ngày
+
+# Nếu APISIX có proxy_read_timeout = 60s (default):
+t=0s    RGW-Sync DC1 → APISIX DC2 → RGW-Sync DC2  ✅ kết nối
+t=60s   Không có data trên connection trong 60s
+t=60s   APISIX cắt connection ← timeout!
+t=60s   RGW-Sync DC1 nhận RST, phải reconnect
+        → window inconsistency tạm thời
+        → log đầy error reconnect
+        → worst case: object chưa sync xong bị bỏ dở
+```
+#### Pattern 1 - Chỉ RGW-data đi qua APISIX
 ##### Phương án 1.A — 3 VM (gộp APISIX vào Ceph VM)
 ```
 DC1: VM Ceph DC1 + APISIX DC1  (chung VM)
@@ -300,107 +417,6 @@ DC1: VM APISIX ZG
 
 
 #### Pattern 2 - Cả 2 RGW-data và RGW-sync đều đi qua APISIX
-##### Inbound/Outbound listen port
-```
-                     APISIX ZG
-              ┌────────────────────────────────────┐
-CLIENT ───────┼─► :443  (Inbound)                  │  - ZoneGroup endpoint duy nhất cho client
-(S3 API/      │ Data Plane Listener                │  - TLS terminate, Split-Horizon DNS
- App/SDK)     │ s3.rgw-tenant.vn                   │  - Route sang DC1 hoặc DC2 theo health check
-              │    → nhận S3 request               │
-              │          │                         │
-              │          ▼                         │
-              │ [Plugin chain S3]                  │
-              │   ip-restriction, limit-req,       │
-              │   prometheus                       │
-              │ [Upstream] backend (Outbound) ─────┼─► APISIX DC1 :443
-              │ [Balancer + Health Check]     ─────┼─► APISIX DC2 :443
-              │ (active health check DC1/DC2)      │  - Không proxy Sync traffic
-              │                                    │  - Forward tới APISIX DC1/DC2, không thẳng RGW
-              │                                    │              
-ADMIN ────────┼──► :9180 (Inbound)                 │
-(curl/UI)     │ Control Plane - Admin API Listener │  - IP whitelist nghiêm ngặt
-              │    → CRUD Route/Upstream/Plugin    │
-              │    → ghi vào etcd                  │
-              └────────────────────────────────────┘
-                    APISIX DC1 / DC2
-              ┌────────────────────────────────────┐
-CLIENT ───────┼─► :443  (Inbound)                  │  - Nhận S3 request từ client,
-(S3 API/      │ Data Plane Listener                │       public port 443 cho client thấy
- App/SDK)     │    → nhận S3 request               │  - TLS terminate tại đây,
-              │          │                         │       APISIX giải mã rồi forward xuống
-              │          ▼                         │
-              │ [Plugin chain S3].                 │
-              │   ip-restriction, limit-req,       │
-              │   jwt/hmac, prometheus             │
-              │ [Upstream] backend (Outbound) ─────┼─► RGW-Data DC1(hoặc DC2) :3950
-              │ [Balancer]                         │  - APISIX là client, RGW-Data là server
-              │                                    │  - APISIX không listen :3950
-              │                                    │
-RGW-Sync ─────┼─► :3951 (Inbound)                  │  - Cả 2 DC chủ động gọi vào DC còn lại để sync
-              │ Data Plane Listener                │  - Long-lived / persistent connection
-              │    → nhận Sync request.            │  - KHÔNG rate-limit
-              │          │                         │
-              │          ▼                         │
-              │ [Plugin chain Sync]                │
-              │   ip-restriction (IP của DC kia)   │
-              │   log, prometheus                  │
-              │   timeout = 0                      │
-              │ [Upstream] backend (Outbound) ─────┼─► RGW-Sync DC1(hoặc DC2) :3951
-              │ [Balancer]                         │  - APISIX là client, RGW-Sync là server
-              │                                    │  - APISIX không listen :3951 phía backend
-              │                                    │
-ADMIN ────────┼─► :9180 (Inbound)                  │
-(curl/UI)     │ Control Plane - Admin API Listener │  - Không có traffic S3/Sync đi qua đây
-              │    → CRUD Route/Upstream/Plugin    │  - Chỉ dùng cấu hình APISIX
-              │    → ghi vào etcd                  │  - IP whitelist nghiêm ngặt, không expose
-              └────────────────────────────────────┘
-
-═══════════════════════════════════════════════════════════════════════════════════════════════
- Port Summary — Pattern 2
-─────────────────────────────────────────────────────────────────────────────────────────────
- Port   Direction            Plugin nên dùng                Ghi chú
- :443   Inbound  (client)    ip-restriction, limit-req,     S3 traffic, TLS terminate
-                             jwt/hmac, prometheus
- :3951  Inbound  (DC kia)    ip-restriction (DC IP only),   Long-lived, timeout = 0 ⚠️
-                             log, prometheus                KHÔNG limit-req
- :3950  Outbound (→ RGW)     N/A (upstream config)          APISIX không listen port này
- :3951  Outbound (→ RGW)     N/A (upstream config)          keepalive idle_timeout = 3600s+
- :9180  Inbound  (admin)     IP whitelist OS-level          Control Plane only
-═══════════════════════════════════════════════════════════════════════════════════════════════
-```
-##### [Luồng S3 request tới RGW-data thông qua APISIX tương tự với Pattern 1](#luồng-s3-request-tới-rgw-data-thông-qua-apisix)
-##### Luồng sync giữa RGW-sync của 2 DC thông qua APISIX
-```
-[RGW-Sync DC1]
-    │
-    │ 1. Outbound HTTP → APISIX DC2 :3951
-    │    (DC1 chủ động kết nối sang DC2)
-    ▼
-[APISIX DC2] Listener :3951
-    │  Router match port :3951
-    │  Plugin chain:
-    │   ├─ ip-restriction  (chỉ cho phép IP DC1)
-    │   ├─ proxy-rewrite   (nếu cần)
-    │   └─ log             (audit sync traffic)
-    │  Balancer → RGW-Sync DC2
-    │
-    │ 2. Outbound HTTP → RGW-Sync DC2 :3951
-    ▼
-[RGW-Sync DC2 :3951]
-    │  Xử lý sync metadata/data
-    │  Ghi vào RADOS Pool DC2
-    │
-    │ 3. Response → APISIX DC2
-    ▼
-[APISIX DC2]
-    │
-    │ 4. Response → RGW-Sync DC1
-    ▼
-[RGW-Sync DC1]
-    (xác nhận sync thành công)
-```
-
 ##### Phương án 2.A — 3 VM (gộp APISIX vào Ceph VM)
 ```
 CLIENT ──► APISIX :443  ──► RGW-Data :3950
@@ -463,21 +479,6 @@ DC1 APISIX :3951 ◄────────────────────
 | ✅ Ưu    | Full isolation. Log + monitor tập trung cả Data lẫn Sync. Ceph không bị ảnh hưởng khi APISIX config thay đổi. Scale và tune hoàn toàn độc lập   |
 | ❌ Nhược | +2 VM. Sync đi qua thêm 1 hop APISIX → cần tune timeout cẩn thận. Config phức tạp hơn 1.B                                   |
 | ⚠️ Lưu ý | Cần 2 Route riêng trên APISIX DC1/DC2: <br> - Route :443 (timeout ngắn, rate-limit) <br> - Route :3951 (timeout = 0, không rate-limit). <br> APISIX restart phải graceful để Sync không bị ngắt đột ngột |
-
-
-Ma trận so sánh
-|                     |   1.A   |   1.B   |   2.A   |       2.B         |
-| ------------------- | ------- | ------- | ------- | ---------------   |
-| VM count            |    3    |    5    |    3    |        5          |
-| Chi phí             |   Thấp  | Cao hơn |   Thấp  |     Cao hơn       |
-| Resource isolation  |    ❌   |   ✅    |  ❌ ❌  |       ✅         |
-| Blast radius        |    ❌   |   ✅    |  ❌❌   |       ✅         |
-| Sync visibility     |    ❌   |   ❌    |   ✅    |       ✅         |
-| Sync risk           |   Thấp  |  Thấp   |   Cao   |    Trung bình    | 
-| Config phức tạp      |   Thấp  |  Trung  |  Trung  |       Cao        |
-| SLA S3 API          |    ⚠️   |   ✅    |   ❌    |       ✅         |
-| Production-ready    |    ❌   |   ✅    |   ❌    | ⚠️ với điều kiện |
-
 
 ```
 # Các điểm khác biệt giữa hoạt động của RGW-Sync vs RGW-Data
